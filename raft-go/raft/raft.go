@@ -48,6 +48,27 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// Persistent state 
+	// (Updated on stable storage before responding to RPCs)
+	
+	currentTerm int // latest term server has seen
+	votedFor int // candidateId that received vote in current term
+	log []*LogEntry // log entries; each entry contains command for state machine, 
+	// and term when entry was received by leader
+
+	// Volatile state on all servers
+	
+	commitIndex int// index of highest log entry known to be committed
+	lastApplied int // index of highest log entry applied to state machine 
+	isLeader bool // server belief whether it is leader or not
+
+	// Volatile state on leaders 
+	// (Reinitialized after election)
+
+	nextIndex []int // index of the next log entry to send to that server 
+	matchIndex []int // index of highest log entry known to be replicated on server
+
+
 }
 
 // return currentTerm and whether this server
@@ -57,6 +78,8 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (3A).
+	term = rf.currentTerm
+	isleader = rf.isLeader
 	return term, isleader
 }
 
@@ -64,12 +87,23 @@ func (rf *Raft) GetState() (int, bool) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
+	
+	// partA:
+
+	Term int // candidate’s term
+	CandidateId int // candidate requesting vote
+	LastLogIndex int // index of candidate’s last log entry
+	LastLogTerm int // term of candidate’s last log entry (§5.4)
+	
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
+	
+	Term int // currentTerm, for candidate to update itself
+	VoteGranted bool // true means candidate received vote
 }
 
 // example RequestVote RPC handler.
@@ -79,10 +113,22 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 type AppendEntriesArgs struct {
 	// Your data here (3A, 3B).
+	
+	Term int // leader’s term
+	LeaderId int // so follower can redirect clients
+	PrevLogIndex int // index of log entry immediately preceding new ones
+	PrevLogTerm int // term of prevLogIndex entry
+	Entries []*LogEntry // log entries to store (empty for heartbeat; 
+	// may send more than one for efficiency)
+	LeaderCommit int // leader’s commitIndex
 }
 
 type AppendEntriesReply struct {
 	// Your data here (3A, 3B).
+	Term int // currentTerm, for leader to update itself 
+	Success bool // true if follower contained entry matching 
+	// prevLogIndex and prevLogTermterm 
+
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
