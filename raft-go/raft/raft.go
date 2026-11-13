@@ -109,6 +109,25 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if args.Term < rf.currentTerm{
+		reply.VoteGranted = false
+		reply.Term = rf.currentTerm
+		return
+	}
+	lastIndex := len(rf.log) - 1
+    lastTerm := rf.log[lastIndex].Term
+	
+	if (rf.votedFor == -1 ||
+		 rf.votedFor == args.CandidateId) &&
+		 (args.LastLogTerm >= lastTerm){
+		reply.VoteGranted = true
+
+	}
+
+
 }
 
 type AppendEntriesArgs struct {
@@ -133,6 +152,44 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// Your code here (3A, 3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// 1. idle leader
+	if (args.Term < rf.currentTerm){
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		return
+	}
+	termMatch := rf.log[args.PrevLogIndex].Term ==args.PrevLogTerm
+	// 2. log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
+	if (!termMatch || args.PrevLogIndex >= len(rf.log)){
+		reply.Success = false
+		return
+	}
+
+	for i, entry := range args.Entries{
+		idx := args.PrevLogIndex + 1 + i
+		termMatch_ := rf.log[idx].Term ==entry.Term
+		// 3. an existing entry conflicts with a new one 
+		// (same index but different terms)
+		if idx < len(rf.log) && !termMatch_{
+			// delete current and following entries
+			rf.log = rf.log[:idx]
+		}
+		// 4. append any new entries not already in the log
+		if idx >= len(rf.log){
+			rf.log = append(rf.log, entry)
+		}
+	}
+	
+
+	// 5. update index of last new entry
+	lastEntryIdx := args.PrevLogIndex + len(args.Entries)
+	if args.LeaderCommit > rf.commitIndex{
+		rf.commitIndex = min(args.LeaderCommit,lastEntryIdx)
+	}
+
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -214,6 +271,19 @@ func Make(peers []*labrpc.ClientEnd, me int, applyCh chan ApplyMsg) *Raft {
 	rf.me = me
 
 	// Your initialization code here (3A, 3B).
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.log = []*LogEntry{{Term: 0}}
+	
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	n := len(rf.peers)
+	rf.nextIndex = make([]int, n) // zeros
+	rf.matchIndex = make([]int, n) // zeros
+	for i := range rf.nextIndex {
+	// leader's last log index + 1
+    rf.nextIndex[i] = len(rf.log) 
+	}
 
 	return rf
 }
