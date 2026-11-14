@@ -177,6 +177,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.votedFor = -1
 		rf.isLeader = false
 	}
+	rf.resetElectionTimer()
 	termMatch := rf.log[args.PrevLogIndex].Term == args.PrevLogTerm
 	// 2. log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
 	if !termMatch || args.PrevLogIndex >= len(rf.log) {
