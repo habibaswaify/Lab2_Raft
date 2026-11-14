@@ -301,36 +301,145 @@ func Make(peers []*labrpc.ClientEnd, me int, applyCh chan ApplyMsg) *Raft {
 		rf.nextIndex[i] = len(rf.log)
 	}
 
+	rf.resetElectionTimer()
+	go rf.electionTick()
 	return rf
 }
 
 // part 3A helper functions
 // heartbeat
 func (rf *Raft) heartbeatLoop(term int) {
+	for {
+		rf.mu.Lock()
+		// check that the server is a leader aand it is not stale
+		if !rf.isLeader || rf.currentTerm != term {
+			rf.mu.Unlock()
+			return
+		}
+		for server := range rf.peers {
+			// send heartbeats to all *other* servers
+			if server == rf.me {
+				continue
+			}
+			//TODO: in 3B build PrevLogIndex/PrevLogTerm from rf.nextIndex[server]
+			// (prev = nextIndex[server]-1) and set Entries to a copy of
+			// rf.log[nextIndex[server]:]
+			// instead of always sending an empty heartbeat from the end of the log
+			args := &AppendEntriesArgs{
+				Term:         rf.currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: len(rf.log) - 1,
+				PrevLogTerm:  rf.log[len(rf.log)-1].Term,
+				LeaderCommit: rf.commitIndex,
+			}
+			go func(server int) {
+				reply := &AppendEntriesReply{}
+				if rf.sendAppendEntries(server, args, reply) {
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					// if any of the other servers are ahead of current leader
+					// transfer leadership
+					if reply.Term > rf.currentTerm {
+						rf.currentTerm = reply.Term
+						rf.votedFor = -1
+						rf.isLeader = false
+						rf.resetElectionTimer()
+						return
+					}
+					//TODO: in 3B if reply.Success update matchIndex[server] and nextIndex[server], then increment commitIndex
+					// if it failed because of log mismatch decrement nextIndex[server] and retry on the next round.
+				}
+			}(server)
+		}
+		rf.mu.Unlock()
+		time.Sleep((100 * time.Millisecond))
+
+	}
 
 }
 func (rf *Raft) startElection() {
+	rf.mu.Lock()
+	// increment current term
+	rf.currentTerm++
+	currTerm := rf.currentTerm
+	// vote for self
+	rf.votedFor = rf.me
+	rf.resetElectionTimer()
+
+	args := &RequestVoteArgs{
+		Term:         currTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: len(rf.log) - 1,
+		LastLogTerm:  rf.log[len(rf.log)-1].Term,
+	}
+	rf.mu.Unlock()
+
+	votes := 1
+	for server := range rf.peers {
+		// request votes from all *other* servers
+		if server == rf.me {
+			continue
+		}
+		go func(server int) {
+			reply := &RequestVoteReply{}
+			// vote denied
+			if !rf.sendRequestVote(server, args, reply) {
+				return
+			}
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			// if any of the other servers are ahead of current leader
+			// transfer leadership
+			if reply.Term > rf.currentTerm {
+				rf.currentTerm = reply.Term
+				rf.votedFor = -1
+				rf.isLeader = false
+				rf.resetElectionTimer()
+				return
+			}
+			// stale replies
+			if rf.currentTerm != currTerm || !reply.VoteGranted {
+				return
+			}
+			votes++
+			// votes are more than half , winner
+			if votes > len(rf.peers)/2 && !rf.isLeader {
+				rf.isLeader = true
+				n := len(rf.peers)
+				rf.nextIndex = make([]int, n)
+				rf.matchIndex = make([]int, n) // zeros
+				for i := range rf.nextIndex {
+					rf.nextIndex[i] = len(rf.log)
+				}
+
+				go rf.heartbeatLoop(currTerm)
+
+			}
+		}(server)
+	}
 
 }
+
 // timer that waits on election timeouts
 func (rf *Raft) electionTick() {
 
-    for {
+	for {
 		// reroll the timer before the timeout
-        time.Sleep(10 * time.Millisecond)
-        rf.mu.Lock()
-        if !rf.isLeader && time.Since(rf.lastTimestamp) >= rf.electionTimeout {
-            rf.mu.Unlock()
-            rf.startElection()
-            continue
-        }
-        rf.mu.Unlock()
-    }
+		time.Sleep(10 * time.Millisecond)
+		rf.mu.Lock()
+		if !rf.isLeader && time.Since(rf.lastTimestamp) >= rf.electionTimeout {
+			rf.mu.Unlock()
+			rf.startElection()
+			continue
+		}
+		rf.mu.Unlock()
+	}
 
 }
+
 // helper function to reset the timer
-func (rf *Raft) resetElectionTimer() { // call with rf.mu held
+func (rf *Raft) resetElectionTimer() {
 	rf.lastTimestamp = time.Now()
-	// set random timeout  200-300s
+	// set random timeout  200-300ms
 	rf.electionTimeout = time.Duration(200+rand.Intn(100)) * time.Millisecond
 }
