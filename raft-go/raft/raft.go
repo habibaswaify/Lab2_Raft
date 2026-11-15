@@ -72,6 +72,7 @@ type Raft struct {
 
 	lastTimestamp   time.Time // timestampt to check for timeout
 	electionTimeout time.Duration
+    applyCh chan ApplyMsg // channel to notify committed entries
 }
 
 // return currentTerm and whether this server
@@ -131,12 +132,23 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	lastIndex := len(rf.log) - 1
 	lastTerm := rf.log[lastIndex].Term
 
-	if (rf.votedFor == -1 ||
-		rf.votedFor == args.CandidateId) &&
-		(args.LastLogTerm >= lastTerm) {
+	//Section 5.4 election restriction check
+	// Candidate's log is at least as up-to-date if:
+	// - candidate's last log term > receiver's last log term, OR
+	// - terms are equal and candidate's last log index >= receiver's last log index
+	isLogUpToDate := false
+	if args.LastLogTerm > lastTerm {
+		isLogUpToDate = true
+	} else if args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIndex {
+		isLogUpToDate = true
+	}
+
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && isLogUpToDate {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
 		rf.resetElectionTimer()
+	} else {
+		reply.VoteGranted = false
 	}
 
 }
@@ -177,27 +189,27 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.votedFor = -1
 		rf.isLeader = false
 	}
+	reply.Term = rf.currentTerm
 	rf.resetElectionTimer()
-	termMatch := rf.log[args.PrevLogIndex].Term == args.PrevLogTerm
+
 	// 2. log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
-	if !termMatch || args.PrevLogIndex >= len(rf.log) {
+	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
 		return
 	}
-
 	for i, entry := range args.Entries {
 		idx := args.PrevLogIndex + 1 + i
-		termMatch := rf.log[idx].Term == entry.Term
 		// 3. an existing entry conflicts with a new one
 		// (same index but different terms)
-		if idx < len(rf.log) && !termMatch {
-			// delete current and following entries
-			rf.log = rf.log[:idx]
-		}
-		// 4. append any new entries not already in the log
-		if idx >= len(rf.log) {
+		if idx < len(rf.log) {
+			if rf.log[idx].Term != entry.Term {
+				// delete current and following entries
+				rf.log = rf.log[:idx]
+				rf.log = append(rf.log, entry)
+			}
+		} else {
+			// 4. append any new entries not already in the log
 			rf.log = append(rf.log, entry)
-			rf.resetElectionTimer()
 		}
 	}
 
@@ -206,6 +218,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, lastEntryIdx)
 	}
+	reply.Success = true
 
 }
 
@@ -304,9 +317,33 @@ func Make(peers []*labrpc.ClientEnd, me int, applyCh chan ApplyMsg) *Raft {
 
 	rf.resetElectionTimer()
 	go rf.electionTick()
+	go rf.applier() // start commit applier goroutine
 	return rf
 }
+// Background goroutine to apply committed log entries to applyCh
+func (rf *Raft) applier() {
+	for {
+		time.Sleep(10 * time.Millisecond)
 
+		var entriesToApply []ApplyMsg
+
+		rf.mu.Lock()
+		for rf.commitIndex > rf.lastApplied {
+			rf.lastApplied++
+			msg := ApplyMsg{
+				Index:   rf.lastApplied,
+				Command: rf.log[rf.lastApplied].Command,
+			}
+			entriesToApply = append(entriesToApply, msg)
+		}
+		rf.mu.Unlock()
+
+		// Send committed entries over channel WITHOUT holding rf.mu lock
+		for _, msg := range entriesToApply {
+			rf.applyCh <- msg
+		}
+	}
+}
 // part 3A helper functions
 // heartbeat
 func (rf *Raft) heartbeatLoop(term int) {
