@@ -1,5 +1,4 @@
 package raft
-
 //
 // this is an outline of the API that raft must expose to
 // the service (or tester). see comments below for
@@ -19,7 +18,6 @@ package raft
 
 import (
 	"sync"
-
 	"lab2raft/labrpc"
 	"math/rand"
 	"time"
@@ -73,6 +71,7 @@ type Raft struct {
 	lastTimestamp   time.Time // timestampt to check for timeout
 	electionTimeout time.Duration
     applyCh chan ApplyMsg // channel to notify committed entries
+	replicateNow chan struct{}
 }
 
 // return currentTerm and whether this server
@@ -93,9 +92,8 @@ func (rf *Raft) GetState() (int, bool) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
-
+	
 	// partA:
-
 	Term         int // candidate’s term
 	CandidateId  int // candidate requesting vote
 	LastLogIndex int // index of candidate’s last log entry
@@ -270,15 +268,46 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
 // the leader.
+
+
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := false
+    rf.mu.Lock()
 
-	// Your code here (3B).
+    term := rf.currentTerm
 
-	return index, term, isLeader
+    // 1. Only the leader can accept new commands.
+    if !rf.isLeader {
+        rf.mu.Unlock()
+        return -1, term, false
+    }
+
+    // 2. Append the new command to the leader's log.
+    newEntry := &LogEntry{
+        Command: command,
+        Term:    term,
+    }
+    rf.log = append(rf.log, newEntry)
+
+    // 3. Get the index of the newly appended entry.
+    index := len(rf.log) - 1
+
+    // 4. Update the leader's own replication trackers.
+    rf.matchIndex[rf.me] = index
+    rf.nextIndex[rf.me] = index + 1
+
+    rf.mu.Unlock()
+
+    // 5. Signal the replication loop.
+    select {
+    case rf.replicateNow <- struct{}{}:
+    default:
+    }
+
+    // 6. Return immediately without waiting for replication.
+    return index, term, true
 }
+
+
 
 // the tester calls Kill() when a Raft instance won't
 // be needed again. you are not required to do anything
@@ -304,6 +333,8 @@ func Make(peers []*labrpc.ClientEnd, me int, applyCh chan ApplyMsg) *Raft {
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.log = []*LogEntry{{Term: 0}}
+	rf.replicateNow = make(chan struct{}, 1)
+	rf.applyCh = applyCh
 
 	rf.commitIndex = 0
 	rf.lastApplied = 0
@@ -346,55 +377,150 @@ func (rf *Raft) applier() {
 }
 // part 3A helper functions
 // heartbeat
+
 func (rf *Raft) heartbeatLoop(term int) {
-	for {
-		rf.mu.Lock()
-		// check that the server is a leader aand it is not stale
-		if !rf.isLeader || rf.currentTerm != term {
-			rf.mu.Unlock()
-			return
-		}
-		for server := range rf.peers {
-			// send heartbeats to all *other* servers
-			if server == rf.me {
-				continue
-			}
-			//TODO: in 3B build PrevLogIndex/PrevLogTerm from rf.nextIndex[server]
-			// (prev = nextIndex[server]-1) and set Entries to a copy of
-			// rf.log[nextIndex[server]:]
-			// instead of always sending an empty heartbeat from the end of the log
-			args := &AppendEntriesArgs{
-				Term:         rf.currentTerm,
-				LeaderId:     rf.me,
-				PrevLogIndex: len(rf.log) - 1,
-				PrevLogTerm:  rf.log[len(rf.log)-1].Term,
-				LeaderCommit: rf.commitIndex,
-			}
-			go func(server int) {
-				reply := &AppendEntriesReply{}
-				if rf.sendAppendEntries(server, args, reply) {
-					rf.mu.Lock()
-					defer rf.mu.Unlock()
-					// if any of the other servers are ahead of current leader
-					// transfer leadership
-					if reply.Term > rf.currentTerm {
-						rf.currentTerm = reply.Term
-						rf.votedFor = -1
-						rf.isLeader = false
-						rf.resetElectionTimer()
-						return
+    for {
+        rf.mu.Lock()
+        if !rf.isLeader || rf.currentTerm != term {
+            rf.mu.Unlock()
+            return
+        }
+
+        for server := range rf.peers {
+            if server == rf.me {
+                continue
+            }
+
+            // Find the next entry to send
+            next := rf.nextIndex[server]
+            prev := next - 1
+
+            // Prepare AppendEntries arguments
+            args := &AppendEntriesArgs{
+                Term:         rf.currentTerm,
+                LeaderId:     rf.me,
+                PrevLogIndex: prev,
+                PrevLogTerm:  rf.log[prev].Term,
+                Entries:      append([]*LogEntry(nil), rf.log[next:]...),
+                LeaderCommit: rf.commitIndex,
+            }
+            go func(server int, args *AppendEntriesArgs) {
+                reply := &AppendEntriesReply{}
+
+                // Send AppendEntries RPC
+                if !rf.sendAppendEntries(server, args, reply) {
+                    return
+                }
+
+                rf.mu.Lock()
+                defer rf.mu.Unlock()
+                if reply.Term > rf.currentTerm {
+                    rf.currentTerm = reply.Term
+                    rf.votedFor = -1
+                    rf.isLeader = false
+                    rf.resetElectionTimer()
+                    return
+                }
+                if !rf.isLeader || rf.currentTerm != args.Term {
+                    return
+                }
+
+
+				if reply.Success {
+
+					// Last entry confirmed by this RPC
+					lastReplicated := args.PrevLogIndex + len(args.Entries)
+
+					// Update matchIndex
+					if lastReplicated > rf.matchIndex[server] {
+						rf.matchIndex[server] = lastReplicated
 					}
-					//TODO: in 3B if reply.Success update matchIndex[server] and nextIndex[server], then increment commitIndex
-					// if it failed because of log mismatch decrement nextIndex[server] and retry on the next round.
-				}
-			}(server)
-		}
-		rf.mu.Unlock()
-		time.Sleep((100 * time.Millisecond))
 
-	}
+					// Update nextIndex
+					if lastReplicated+1 > rf.nextIndex[server] {
+						rf.nextIndex[server] = lastReplicated + 1
+					}
 
+					// Task 5: Check if a majority has replicated an entry
+					rf.advanceCommitIndexLocked()
+
+				}  else {
+
+
+                    // Ignore outdated failure responses
+                    if rf.nextIndex[server] == args.PrevLogIndex+1 &&
+                        rf.matchIndex[server] < args.PrevLogIndex &&
+                        rf.nextIndex[server] > 1 {
+
+                        // Move backward to find a matching entry
+                        rf.nextIndex[server]--
+
+                        // Trigger another replication attempt
+                        select {
+                        case rf.replicateNow <- struct{}{}:
+                        default:
+                        }
+                    }
+                }
+
+            }(server, args)
+        }
+
+        rf.mu.Unlock()
+
+        select {
+        case <-rf.replicateNow:
+            // New command or retry requested
+        case <-time.After(100 * time.Millisecond):
+            // Periodic heartbeat
+        }
+    }
 }
+
+
+
+func (rf *Raft) advanceCommitIndexLocked() {
+
+    // 1. Only the leader can calculate commitment this way
+    if !rf.isLeader {
+        return
+    }
+
+    // 2. Check log entries from newest to oldest
+    for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
+
+        // 3. Only count entries from the current term
+        if rf.log[N].Term != rf.currentTerm {
+            continue
+        }
+
+        // 4. Count servers that replicated entry N
+        count := 0
+
+        for i := range rf.peers {
+            if rf.matchIndex[i] >= N {
+                count++
+            }
+        }
+
+        // 5. Check if a majority replicated entry N
+        if count > len(rf.peers)/2 {
+
+            // Advance the commit index
+            rf.commitIndex = N
+
+            // Notify followers of the new commit index
+            select {
+            case rf.replicateNow <- struct{}{}:
+            default:
+            }
+
+            break
+        }
+    }
+}
+
+
 func (rf *Raft) startElection() {
 	rf.mu.Lock()
 	// increment current term
@@ -441,21 +567,28 @@ func (rf *Raft) startElection() {
 			}
 			votes++
 			// votes are more than half , winner
+
 			if votes > len(rf.peers)/2 && !rf.isLeader {
 				rf.isLeader = true
+
 				n := len(rf.peers)
+
+				// Initialize replication trackers
 				rf.nextIndex = make([]int, n)
-				rf.matchIndex = make([]int, n) // zeros
+				rf.matchIndex = make([]int, n)
+
 				for i := range rf.nextIndex {
 					rf.nextIndex[i] = len(rf.log)
+					rf.matchIndex[i] = 0
 				}
 
-				go rf.heartbeatLoop(currTerm)
+				// Leader already has its own log entries
+				rf.matchIndex[rf.me] = len(rf.log) - 1
 
+				go rf.heartbeatLoop(currTerm)
 			}
 		}(server)
 	}
-
 }
 
 // timer that waits on election timeouts
