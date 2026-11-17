@@ -115,13 +115,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
+	//Reject requests from older terms
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
 		return
 	}
-
+	//checks whether the candidate has a newer term than this server.
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
@@ -140,7 +140,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else if args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIndex {
 		isLogUpToDate = true
 	}
-
+	// The server has not voted for another candidate in the term, or has already voted for this same candidate.
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && isLogUpToDate {
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
@@ -176,12 +176,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// 1. idle leader
+	//outdated leader
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
 	}
+	// Checks whether the leader's term is newer.
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
@@ -190,14 +191,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	rf.resetElectionTimer()
 
-	// 2. log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
+	// log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
 	if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
 		return
 	}
 	for i, entry := range args.Entries {
 		idx := args.PrevLogIndex + 1 + i
-		// 3. an existing entry conflicts with a new one
+		//an existing entry conflicts with a new one
 		// (same index but different terms)
 		if idx < len(rf.log) {
 			if rf.log[idx].Term != entry.Term {
@@ -206,13 +207,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.log = append(rf.log, entry)
 			}
 		} else {
-			// 4. append any new entries not already in the log
+			//append any new entries not already in the log
 			rf.log = append(rf.log, entry)
 		}
 	}
 
-	// 5. update index of last new entry
-	lastEntryIdx := args.PrevLogIndex + len(args.Entries)
+	// update index of last new entry
+	lastEntryIdx := args.PrevLogIndex + len(args.Entries)//Calculates the last index covered by the request.
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, lastEntryIdx)
 	}
@@ -269,41 +270,40 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 
-
+// Start() is called when an application wants Raft to begin agreeing on a new command.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
     rf.mu.Lock()
 
     term := rf.currentTerm
 
-    // 1. Only the leader can accept new commands.
+    // Only the leader can accept new commands.
     if !rf.isLeader {
         rf.mu.Unlock()
         return -1, term, false
     }
-
-    // 2. Append the new command to the leader's log.
+    //Append the new command to the leader's log.
     newEntry := &LogEntry{
         Command: command,
         Term:    term,
     }
     rf.log = append(rf.log, newEntry)
 
-    // 3. Get the index of the newly appended entry.
+    //Get the index of the newly appended entry.
     index := len(rf.log) - 1
 
-    // 4. Update the leader's own replication trackers.
+    // Update the leader's own replication trackers.
     rf.matchIndex[rf.me] = index
     rf.nextIndex[rf.me] = index + 1
 
     rf.mu.Unlock()
 
-    // 5. Signal the replication loop.
+    // Signal the replication loop.
     select {
     case rf.replicateNow <- struct{}{}:
     default:
     }
 
-    // 6. Return immediately without waiting for replication.
+    //Return immediately without waiting for replication.
     return index, term, true
 }
 
@@ -325,8 +325,8 @@ func (rf *Raft) Kill() {
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
+	rf := &Raft{} 
+	rf.peers = peers//RPC endpoints for every server.
 	rf.me = me
 
 	// Your initialization code here (3A, 3B).
@@ -369,7 +369,7 @@ func (rf *Raft) applier() {
 		}
 		rf.mu.Unlock()
 
-		// Send committed entries over channel WITHOUT holding rf.mu lock
+		//Send committed entries over channel WITHOUT holding rf.mu lock
 		for _, msg := range entriesToApply {
 			rf.applyCh <- msg
 		}
@@ -387,10 +387,9 @@ func (rf *Raft) heartbeatLoop(term int) {
         }
 
         for server := range rf.peers {
-            if server == rf.me {
+            if server == rf.me { //Checks whether the current server is the leader itself
                 continue
             }
-
             // Find the next entry to send
             next := rf.nextIndex[server]
             prev := next - 1
@@ -414,20 +413,19 @@ func (rf *Raft) heartbeatLoop(term int) {
 
                 rf.mu.Lock()
                 defer rf.mu.Unlock()
+				//Checks whether the follower reported a newer term than the leader currently knows
                 if reply.Term > rf.currentTerm {
                     rf.currentTerm = reply.Term
                     rf.votedFor = -1
-                    rf.isLeader = false
+                    rf.isLeader = false //Steps down from leadership.
                     rf.resetElectionTimer()
                     return
                 }
+				//Ignore responses from old leadership periods
                 if !rf.isLeader || rf.currentTerm != args.Term {
                     return
                 }
-
-
 				if reply.Success {
-
 					// Last entry confirmed by this RPC
 					lastReplicated := args.PrevLogIndex + len(args.Entries)
 
@@ -441,15 +439,15 @@ func (rf *Raft) heartbeatLoop(term int) {
 						rf.nextIndex[server] = lastReplicated + 1
 					}
 
-					// Task 5: Check if a majority has replicated an entry
+					//Check if a majority has replicated an entry
 					rf.advanceCommitIndexLocked()
-
+				// failed replictions
 				}  else {
 
 
                     // Ignore outdated failure responses
                     if rf.nextIndex[server] == args.PrevLogIndex+1 &&
-                        rf.matchIndex[server] < args.PrevLogIndex &&
+                        rf.matchIndex[server] < args.PrevLogIndex && //Checks that the leader has not already confirmed replication through the requested preceding entry
                         rf.nextIndex[server] > 1 {
 
                         // Move backward to find a matching entry
@@ -481,7 +479,7 @@ func (rf *Raft) heartbeatLoop(term int) {
 
 func (rf *Raft) advanceCommitIndexLocked() {
 
-    // 1. Only the leader can calculate commitment this way
+    //Only the leader can calculate commitment this way
     if !rf.isLeader {
         return
     }
@@ -489,7 +487,7 @@ func (rf *Raft) advanceCommitIndexLocked() {
     // 2. Check log entries from newest to oldest
     for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
 
-        // 3. Only count entries from the current term
+        // Only count entries from the current term
         if rf.log[N].Term != rf.currentTerm {
             continue
         }
@@ -503,7 +501,7 @@ func (rf *Raft) advanceCommitIndexLocked() {
             }
         }
 
-        // 5. Check if a majority replicated entry N
+        // Check if a majority replicated entry N
         if count > len(rf.peers)/2 {
 
             // Advance the commit index
@@ -598,7 +596,8 @@ func (rf *Raft) electionTick() {
 		// reroll the timer before the timeout
 		time.Sleep(10 * time.Millisecond)
 		rf.mu.Lock()
-		if !rf.isLeader && time.Since(rf.lastTimestamp) >= rf.electionTimeout {
+		// Only nonleaders should start elections.
+		if !rf.isLeader && time.Since(rf.lastTimestamp) >= rf.electionTimeout { //Checks whether enough time has passed since the timer was last reset.
 			rf.mu.Unlock()
 			rf.startElection()
 			continue
