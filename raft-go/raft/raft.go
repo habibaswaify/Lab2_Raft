@@ -18,6 +18,7 @@ package raft
 
 import (
 	"sync"
+	"sync/atomic"
 	"lab2raft/labrpc"
 	"math/rand"
 	"time"
@@ -72,6 +73,8 @@ type Raft struct {
 	electionTimeout time.Duration
     applyCh chan ApplyMsg // channel to notify committed entries
 	replicateNow chan struct{}
+	dead int32 // Added for Kill implementation
+
 }
 
 // return currentTerm and whether this server
@@ -150,7 +153,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 }
-
+//1. Sending heartbeats to Followers. 2.Replicating log entries from the Leader to Followers.
 type AppendEntriesArgs struct {
 	// Your data here (3A, 3B).
 
@@ -314,9 +317,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // in Kill(), but it might be convenient to (for example)
 // turn off debug output from this instance.
 func (rf *Raft) Kill() {
-	// Your code here, if desired.
+	atomic.StoreInt32(&rf.dead, 1)
 }
 
+// Check whether this Raft instance has been killed.
+func (rf *Raft) killed() bool {
+	return atomic.LoadInt32(&rf.dead) == 1
+}
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -354,6 +361,9 @@ func Make(peers []*labrpc.ClientEnd, me int, applyCh chan ApplyMsg) *Raft {
 // Background goroutine to apply committed log entries to applyCh
 func (rf *Raft) applier() {
 	for {
+		if rf.killed() {
+			return
+		}
 		time.Sleep(10 * time.Millisecond)
 
 		var entriesToApply []ApplyMsg
@@ -371,6 +381,9 @@ func (rf *Raft) applier() {
 
 		//Send committed entries over channel WITHOUT holding rf.mu lock
 		for _, msg := range entriesToApply {
+			if rf.killed() {
+				return
+			}
 			rf.applyCh <- msg
 		}
 	}
@@ -380,6 +393,9 @@ func (rf *Raft) applier() {
 
 func (rf *Raft) heartbeatLoop(term int) {
     for {
+		if rf.killed() {
+			return
+		}
         rf.mu.Lock()
         if !rf.isLeader || rf.currentTerm != term {
             rf.mu.Unlock()
@@ -404,6 +420,9 @@ func (rf *Raft) heartbeatLoop(term int) {
                 LeaderCommit: rf.commitIndex,
             }
             go func(server int, args *AppendEntriesArgs) {
+				if rf.killed() {
+					return
+				}				
                 reply := &AppendEntriesReply{}
 
                 // Send AppendEntries RPC
@@ -413,6 +432,9 @@ func (rf *Raft) heartbeatLoop(term int) {
 
                 rf.mu.Lock()
                 defer rf.mu.Unlock()
+				if rf.killed() {
+					return
+				}				
 				//Checks whether the follower reported a newer term than the leader currently knows
                 if reply.Term > rf.currentTerm {
                     rf.currentTerm = reply.Term
@@ -543,6 +565,9 @@ func (rf *Raft) startElection() {
 			continue
 		}
 		go func(server int) {
+			if rf.killed() {
+				return
+			}			
 			reply := &RequestVoteReply{}
 			// vote denied
 			if !rf.sendRequestVote(server, args, reply) {
@@ -550,6 +575,9 @@ func (rf *Raft) startElection() {
 			}
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
+			if rf.killed() {
+				return
+			}			
 			// if any of the other servers are ahead of current leader
 			// transfer leadership
 			if reply.Term > rf.currentTerm {
@@ -591,8 +619,10 @@ func (rf *Raft) startElection() {
 
 // timer that waits on election timeouts
 func (rf *Raft) electionTick() {
-
 	for {
+		if rf.killed() {
+			return
+		}
 		// reroll the timer before the timeout
 		time.Sleep(10 * time.Millisecond)
 		rf.mu.Lock()
